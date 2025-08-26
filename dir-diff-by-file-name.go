@@ -68,7 +68,6 @@ number of total comparisons done: 5
 
 */
 
-
 package main
 
 import (
@@ -87,6 +86,7 @@ import (
 
 func main() {
 	algo := flag.String("algo", "sha1", "hash algorithm: sha1 or sha256")
+	genCP := flag.Bool("cp", false, "after stats, emit cp commands for each differing pair (with backups)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] <dir1> <dir2>\n\n", filepath.Base(os.Args[0]))
 		fmt.Fprintln(os.Stderr, "Shows all files from dir1 (including hidden). Compares by NAME only against dir2.")
@@ -112,7 +112,7 @@ func main() {
 	if err := mustDir(dir1); err != nil { fatal(err) }
 	if err := mustDir(dir2); err != nil { fatal(err) }
 
-	// filename -> []paths (includes hidden; follows symlinks to files) + total counts
+	// filename -> []paths (includes hidden; follows symlinks to files) + totals
 	nameToPaths1, filesInOne, err := buildAllByName(dir1)
 	if err != nil { fatal(fmt.Errorf("walking %s: %w", dir1, err)) }
 	nameToPaths2, filesInTwo, err := buildAllByName(dir2)
@@ -127,9 +127,10 @@ func main() {
 
 	var totalComparisons int64 // matched pairs + unmatched (count unmatched as 1)
 	var deltas int64           // only pairs with differing hashes
+	var cpCommands []string    // collected cp commands for differing pairs
 
 	for _, name := range names {
-		refPaths := nameToPaths1[name]      // all dir1 paths with this filename (duplicates allowed)
+		refPaths := nameToPaths1[name]      // all dir1 paths with this filename
 		candPaths, ok := nameToPaths2[name] // all dir2 paths with this filename
 
 		if !ok || len(candPaths) == 0 {
@@ -165,11 +166,28 @@ func main() {
 				totalComparisons++
 				if refHash != candHash {
 					deltas++
+					// Emit visual block
+					fmt.Printf("%s %s\n", refHash, ref)
+					fmt.Printf("%s %s\n", candHash, cand)
+					fmt.Printf("diff -y %s %s\n", shellQuote(ref), shellQuote(cand))
+					fmt.Println("---")
+
+					// Prepare cp commands for this differing pair
+					backupName := "." + filepath.Base(cand) + ".backup"
+					backupPath := filepath.Join(filepath.Dir(cand), backupName)
+
+					cpCommands = append(cpCommands,
+						fmt.Sprintf("cp %s %s # backup", shellQuote(cand), shellQuote(backupPath)),
+						fmt.Sprintf("cp %s %s # do the update", shellQuote(ref), shellQuote(cand)),
+						fmt.Sprintf("cp %s %s # undo", shellQuote(backupPath), shellQuote(cand)),
+					)
+				} else {
+					// Equal: still show the comparison block per spec
+					fmt.Printf("%s %s\n", refHash, ref)
+					fmt.Printf("%s %s\n", candHash, cand)
+					fmt.Printf("diff -y %s %s\n", shellQuote(ref), shellQuote(cand))
+					fmt.Println("---")
 				}
-				fmt.Printf("%s %s\n", refHash, ref)
-				fmt.Printf("%s %s\n", candHash, cand)
-				fmt.Printf("diff -y %s %s\n", shellQuote(ref), shellQuote(cand))
-				fmt.Println("---")
 			}
 		}
 	}
@@ -179,6 +197,14 @@ func main() {
 	fmt.Printf("files in two: %d\n", filesInTwo)
 	fmt.Printf("number of deltas: %d\n", deltas)
 	fmt.Printf("number of total comparisons done: %d\n", totalComparisons)
+
+	// Optional: cp commands (only for differing pairs)
+	if *genCP && len(cpCommands) > 0 {
+		fmt.Println("# copy commands (with backups) to sync dir2 from dir1")
+		for _, line := range cpCommands {
+			fmt.Println(line)
+		}
+	}
 }
 
 func mustDir(p string) error {
@@ -195,11 +221,7 @@ func buildAllByName(root string) (map[string][]string, int, error) {
 	count := 0
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil { return err }
-
-		// If it's a symlink to a directory, don't descend (WalkDir won't anyway).
-		if d.IsDir() {
-			return nil
-		}
+		if d.IsDir() { return nil }
 
 		// Follow symlinks to files by using os.Stat (target attributes).
 		info, err := os.Stat(path)
